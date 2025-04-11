@@ -1,0 +1,844 @@
+---
+title: "Untitled"
+output: html_document
+date: "2024-02-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Import function for SLU MVM Data files and RKT output function.
+```{r, include=FALSE}
+import_slu_mvm_data_excel <- function(filename, numeric_var = NA, bad_quality_na = TRUE, sheet = 2){ # function for importing excel files into R
+  #numeric var: the first column with measured numeric variables
+  replace_less_than_var <- function(values, bad_quality_na){ # function for replacing values at the detection limit with half values
+    values_parsed <- values %>% as.character() %>% parse_number(locale = locale(decimal_mark = ","))
+
+    which_intervals <- which(substring(values,1,1) == "[")
+    which_less_than <- which(substring(values,1,1) == "<")
+    if (length(which_less_than) > 0) {
+      values_less_than_half <- values[which_less_than] %>% gsub(",", ".", .) %>% gsub("<","",.) %>% as.numeric()
+      values_parsed[which_less_than] <- values_less_than_half/2}
+
+    if (bad_quality_na == TRUE) {values_parsed[which_intervals] <- NA}
+    else{
+      values_intervals <- values[which_intervals] %>%
+        gsub("\\[","", .) %>%
+        gsub("\\]","", .) %>%
+        gsub(",",".", .) %>%
+        as.numeric()
+      values_parsed[which_intervals] <- values_intervals}
+
+    return(values_parsed)
+  }
+
+  if (is.na(numeric_var) == T) {stop("Supply the column index of first measured numeric variable")}
+out <- suppressWarnings(read_excel(filename, sheet = sheet,guess_max = 50000))
+out <-
+  
+  mutate_at(out, c(numeric_var:ncol(out)),
+            replace_less_than_var,
+            bad_quality_na = bad_quality_na)
+out <-
+  mutate_at(out, c(1:(numeric_var - 1)),
+            (function(x) {
+                          x %>%
+                            as.character() %>%
+                            parse_guess(locale = locale(decimal_mark = ","))
+              })
+           )
+
+}
+
+rkt_out <- function(rkt){
+  tibble(p.value = ifelse(is.na(rkt$sl.corrected)==T, rkt$sl, rkt$sl.corrected), statistic = rkt$S, slope = rkt$B, tau=rkt$tau)
+}
+
+```
+
+
+Load packages
+```{r, include=FALSE}
+library(mgcv)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(janitor)
+library(GWmodel)
+library(knitr)
+library(rkt)
+library(compositions)
+#library(ape)
+library(ggpubr)
+library(factoextra)
+library(plsdepot)
+library(ggrepel)
+```
+
+## Prepare data
+
+Read data from the SLS, define year as the year of observation unless the month of observation is January, then the observation is counted for the year before. Variables are log-transformed (except Alk/Acid pH, vattentemperatur).
+```{r, include=FALSE}
+lakes <- import_slu_mvm_data_excel("SLS2023.xlsx", numeric_var = 29)%>%select(-c(`Siktdjup med kikare (m)`,`Siktdjup utan kikare (m)`))
+lakesRMÖ <- import_slu_mvm_data_excel("SLS_RMÖ2023.xlsx", numeric_var = 29)%>%select(-c(`Slamhalt (mg/l)`,`SO4 (mg/l)`, `Syrgashalt (mg/l O2)`, `Syrgasmättnad (%)`, `Tot-N_ps (µg/l N)`, `Färgtal (mg Pt/l)`, `NO2-N (µg/l N)`,`NO3-N (µg/l N)`, `Tot-P_F (µg/l P)` ))%>%filter(Provtagningsmedium=="Sjö")
+
+
+lakes%>%mutate(year1=year(Provdatum), 
+               month=month(Provdatum),
+               year=case_when(month==1~year1-1,
+                               TRUE~year1)) %>%
+        filter(year!=2007)%>%
+        clean_names()%>%
+        mutate(
+          si_mg_l=case_when(si_mg_l<=0.5~0.25,
+                            TRUE~si_mg_l),
+          cl_mg_l=case_when(cl_mg_l<=0.25~0.125,
+                            TRUE~cl_mg_l), 
+          zn_mg_l=case_when(zn_mg_l<=0.5~0.25,
+                            TRUE~zn_mg_l),
+          v_mg_l=case_when(v_mg_l<=0.03~0.015,
+                           TRUE~v_mg_l),
+          pb_mg_l=case_when(pb_mg_l<=0.02~0.01,
+                            TRUE~pb_mg_l),
+          mn_mg_l=case_when(mn_mg_l<=0.5~0.25,
+                            TRUE~mn_mg_l),
+          ni_mg_l=case_when(ni_mg_l<=0.05~0.025,
+                            TRUE~ni_mg_l),
+          fe_mg_l=case_when(fe_mg_l<=10~5,
+                            TRUE~fe_mg_l),
+          f_mg_l=case_when(f_mg_l<=0.05~0.025,
+                           TRUE~f_mg_l),
+          cu_mg_l=case_when(cu_mg_l<0.04~0.02,
+                            TRUE~cu_mg_l),
+          cr_mg_l=case_when(cr_mg_l<=0.05~0.025,
+                            TRUE~cr_mg_l),
+          co_mg_l=case_when(co_mg_l<=0.01~0.005,
+                            TRUE~co_mg_l),
+          cd_mg_l=case_when(cd_mg_l<=0.006~0.003,
+                            TRUE~cd_mg_l),
+          as_mg_l=case_when(as_mg_l<=0.003~0.0015,
+                            TRUE~as_mg_l),
+          k_mg_l=case_when(k_mg_l<=0.04~0.02,
+                           TRUE~k_mg_l),
+          al_mg_l=case_when(al_mg_l<5~2.5,
+                            TRUE~al_mg_l),
+          nh4_n_mg_l_n=case_when(nh4_n_mg_l_n<=4~2,
+                               TRUE~nh4_n_mg_l_n),
+          no2_no3_n_mg_l_n=case_when(no2_no3_n_mg_l_n<=3~1.5,
+                                     TRUE~no2_no3_n_mg_l_n),
+          toc_mg_l_c=case_when(toc_mg_l_c<=0.05~0.025,
+                               TRUE~toc_mg_l_c),
+          totn=case_when(tot_n_t_nb_mg_l_n<=50~25,
+                               TRUE~tot_n_t_nb_mg_l_n),
+          totp=case_when(tot_p_mg_l_p<=1~0.5,
+                               TRUE~tot_p_mg_l_p),
+          absf=case_when(abs_f_420_5cm<=0.01~0.005,
+                               TRUE~abs_f_420_5cm),
+          so4_ic_mg_l_s=case_when(so4_ic_mg_l_s<=0.16~0.08,
+                                  TRUE~so4_ic_mg_l_s),
+          so4_ic_mg_l_so4=case_when(so4_ic_mg_l_so4<=0.48~0.24,
+                                    TRUE~so4_ic_mg_l_so4),
+          so4_mg_l_s=case_when(so4_mg_l_s<=0.2~0.1,
+                               TRUE~so4_mg_l_s),
+          DIN=nh4_n_mg_l_n+no2_no3_n_mg_l_n,
+           BC=ca_mg_l+mg_mg_l+na_mg_l+k_mg_l,
+          so4_komb=case_when(!is.na(so4_ic_mg_l_s)~so4_ic_mg_l_s/((32.06)/2), 
+                                  !is.na(so4_ic_mg_l_so4)~so4_ic_mg_l_so4/((32.06+4*16)/2),
+                                  TRUE~so4_mg_l_s/(32.06/2)))->lakes1a
+
+lakes1<-lakes1a%>%
+  select(-c(abs_f_254_5cm, abs_f_365_5cm, abs_f_436_m,abs_of_420_5cm, as_f_mg_l,cd_f_mg_l, co_f_mg_l,cr_f_mg_l, cu_f_mg_l, ni_f_mg_l, pb_f_mg_l,  so4_mg_l_s,so4_ic_mg_l_s, so4_ic_mg_l_so4, sr_mg_l, turb_fnu_fnu, u_mg_l,v_f_mg_l, zn_f_mg_l))%>%
+  mutate(across(c(ca_mg_l:v_mg_l,zn_mg_l, absf, so4_komb) , log10, .names="log_{col}"))%>%
+  select(-c(log_p_h))%>%
+  rename(log_so4=log_so4_komb)
+```
+
+Include only lakes that are part of the random selection of the SLS.
+```{r, include=FALSE}
+slump<-read_excel("Slumpade Omdrevssjöprover tom 2023.xlsx")%>%clean_names()%>%select(md_mvm_id)
+
+lakes1<-lakes1%>%filter(md_mvm_id %in% slump$md_mvm_id)
+```
+
+Read climate data and compute overall means, initial values (2008-2013) and change values. Join lakes data.
+The climate data file can be obtained by the author. 
+```{r, include=FALSE}
+klimat<-read_excel("Klimatdata_omdrev.xlsx")%>%
+  clean_names()%>%
+  rename(temp_mean=temperature_c_mean1991to2020,
+         precip_mean=precipitation_mm_mean1991to2020)%>%
+  select(mvmid, temp_mean, precip_mean)
+
+klimat2<-read_excel("Klimat_årsdata.xlsx")%>%clean_names()
+
+klimat2 %>%
+  filter(year>2007 & year<2014 & mvmid !=0)%>%
+  group_by(mvmid) %>%
+  summarize(across(c(temperature_c, precipitation_mm), mean, .names="{col}_start") %>%
+  rename(temp_start=temperature_c_start, precip_start=precipitation_mm_start)) -> klimat_start
+
+klimat2%>%
+  filter(year>2011 & mvmid !=0)%>%
+  nest(data=c(-mvmid, -smhi_id, -name, -east,-north, -station_id))%>%
+  mutate(fit = map(data, possibly(~rkt(date = as.data.frame(.x)$year, y=as.data.frame(.x)$temperature_c, correct = TRUE), otherwise=NA_real_)),
+         tidyfit = map(fit, possibly(~rkt_out(.x), otherwise=NA_real_))) %>% 
+  unnest(tidyfit) %>%
+  select(-data, -fit) %>%
+  select(mvmid, slope) %>%
+  unique()%>%
+  rename(temp_change=slope) ->temp_change
+
+
+klimat2 %>% 
+  filter(year>2011 &mvmid !=0) %>% 
+  nest(data=c(-mvmid, -smhi_id, -name, -east,-north, -station_id)) %>%
+  mutate(fit = map(data, possibly(~rkt(date = as.data.frame(.x)$year, y=as.data.frame(.x)$precipitation_mm, correct = TRUE), otherwise=NA_real_)),
+         tidyfit = map(fit, possibly(~rkt_out(.x), otherwise=NA_real_))) %>% 
+  unnest(tidyfit) %>%
+  select(-data, -fit) %>% 
+  select(mvmid, slope) %>%
+  unique() %>%
+  rename(precip_change=slope) ->precip_change
+
+lakes1<-lakes1 %>%
+  filter(md_mvm_id %in% slump$md_mvm_id) %>%
+  right_join(klimat, by=join_by(md_mvm_id==mvmid)) %>%
+  right_join(temp_change, by=join_by(md_mvm_id==mvmid)) %>%
+  right_join(precip_change, by=join_by(md_mvm_id==mvmid)) %>%
+  right_join(klimat_start, by=join_by(md_mvm_id==mvmid))
+```
+
+
+Read GIS data and transform (package composition). Join lakes data.
+
+```{r}
+GISdata_landuse<-read_excel("all_outputs_omdrevssjöar_vivan2_zero_v3.xlsx", sheet="nmd_plc8")%>%clean_names()%>%select(-hav)%>%
+  mutate(across(.cols=c("blandskog":"oppen_vatmark" ), .fns= ~ .x / 100))
+
+GISdata<-read_excel("all_outputs_omdrevssjöar_vivan2_zero_v3.xlsx", sheet="aro_omdrevsjöar_240522")%>%clean_names()%>%select(mvm_stations_id, elev_utl)%>%rename(mvmid=mvm_stations_id)%>%full_join(GISdata_landuse)
+
+as.data.frame(clr(GISdata%>%select(blandskog:oppen_vatmark)))%>%cbind(GISdata%>%select(mvmid, area_aro_km2,elev_utl))%>%filter(mvmid!=0)->GIS_trans
+
+lakes1%>%full_join(GIS_trans, by=join_by("md_mvm_id"=="mvmid"))%>%filter(!is.na(overvakningsstation) & !is.na(stationskoordinat_n_x))->lakes1b
+```
+
+Set unique IDs for all lakes. If present the national station-ID is used, otherwise the MVM-ID.
+```{r, include=FALSE}
+#Identify which national stations ID are present
+lakes1b %>%
+  dplyr::select(stationskoordinat_e_y, stationskoordinat_n_x, nationellt_overvakningsstations_id) %>%
+  group_by(stationskoordinat_n_x, stationskoordinat_e_y) %>%
+  distinct() %>%
+  slice(1) %>%
+  filter(!is.na(nationellt_overvakningsstations_id)) %>%
+  rename(new_ovv=nationellt_overvakningsstations_id)->stations1
+
+#Join with original dataset to get the same ID for same coordinates
+lakes1b%>%select(-nationellt_overvakningsstations_id) %>%
+  left_join(stations1)%>%
+  mutate(ID=new_ovv)->lakes_withID
+
+#Identify mvm-ID for remaining lakes 
+lakes_withID %>%
+  dplyr::select(md_mvm_id) %>%
+  group_by(md_mvm_id) %>%
+  distinct() %>%
+  slice(1) %>%
+  filter(!is.na(md_mvm_id)) %>%
+  mutate(new_ovv=md_mvm_id)->stations2
+
+#Join with dataset to fill ID for stations that do not have a national ID
+lakes_withID%>%
+  select(-new_ovv) %>%
+  left_join(stations2)%>%
+  mutate(ID=case_when(is.na(ID)~as.character(new_ovv),
+                      TRUE~ID))->lakes_a
+```
+
+Identify stations with only a single observations and remove them.
+
+Remove stations with only one observation after 2011, since station-wise centering and, thus, trend analysis is not possible for them. Remove two stations with outlying values for Ca and Mg.
+```{r, include=FALSE}
+lakes_a %>%
+  filter(year>2011) %>%
+  drop_na(p_h) %>%
+  group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x) %>%
+  mutate(n=n()) %>%
+  filter(n<=1) %>%
+  arrange(ID)%>%
+  dplyr::select( stationskoordinat_e_y, stationskoordinat_n_x, overvakningsstation, ID)->only_single
+
+lakes2 <- lakes_a %>%
+  filter(!ID %in% only_single$ID) %>%
+  filter(!ID %in%c("00202556", "00223105"))
+
+```
+
+Create initial variables all numeric variables 2008-2013
+
+```{r}
+lakes2 %>%
+  filter(year<2014) %>%
+  group_by(ID) %>%
+  summarize(across(c(log_ca_mg_l:log_zn_mg_l,alk_acid_mekv_l, log_absf, p_h, log_so4), last, .names="{col}_start")) -> lakes_startvalue1
+
+lakes2 %>%
+  filter(year>=2014 & year< 2018) %>%
+  group_by(ID)%>%
+  summarize(across(c(log_ca_mg_l:log_zn_mg_l,alk_acid_mekv_l, log_absf, p_h, log_so4), first, .names="{col}_start2")) ->lakes_startvalue2
+
+lakes_startvalue1 %>%
+  full_join(lakes_startvalue2) %>%
+  mutate(
+    #log_al_mg_l_start=ifelse(is.na(log_al_mg_l_start), log_al_mg_l_start2, log_al_mg_l_start),
+        # log_as_mg_l_start=ifelse(is.na(log_as_mg_l_start), log_as_mg_l_start2, log_as_mg_l_start),
+         log_ca_mg_l_start=ifelse(is.na(log_ca_mg_l_start), log_ca_mg_l_start2, log_ca_mg_l_start),
+         log_cd_mg_l_start=ifelse(is.na(log_cd_mg_l_start), log_cd_mg_l_start2, log_cd_mg_l_start),
+         log_cl_mg_l_start=ifelse(is.na(log_cl_mg_l_start), log_cl_mg_l_start2, log_cl_mg_l_start),
+         log_co_mg_l_start=ifelse(is.na(log_co_mg_l_start), log_co_mg_l_start2, log_co_mg_l_start),
+         log_cr_mg_l_start=ifelse(is.na(log_cr_mg_l_start), log_cr_mg_l_start2, log_cr_mg_l_start),
+         log_cu_mg_l_start=ifelse(is.na(log_cu_mg_l_start), log_cu_mg_l_start2, log_cu_mg_l_start),
+         log_f_mg_l_start=ifelse(is.na(log_f_mg_l_start), log_f_mg_l_start2, log_f_mg_l_start),
+         log_fe_mg_l_start=ifelse(is.na(log_fe_mg_l_start), log_fe_mg_l_start2, log_fe_mg_l_start),
+         log_k_mg_l_start=ifelse(is.na(log_k_mg_l_start), log_k_mg_l_start2, log_k_mg_l_start),
+         log_kond_25_m_s_m_start=ifelse(is.na(log_kond_25_m_s_m_start), log_kond_25_m_s_m_start2, log_kond_25_m_s_m_start),
+         log_mg_mg_l_start=ifelse(is.na(log_mg_mg_l_start), log_mg_mg_l_start2, log_mg_mg_l_start),
+         log_mn_mg_l_start=ifelse(is.na(log_mn_mg_l_start), log_mn_mg_l_start2, log_mn_mg_l_start),
+         log_na_mg_l_start=ifelse(is.na(log_na_mg_l_start), log_na_mg_l_start2, log_na_mg_l_start),
+         log_nh4_n_mg_l_n_start=ifelse(is.na(log_nh4_n_mg_l_n_start), log_nh4_n_mg_l_n_start2, log_nh4_n_mg_l_n_start),
+         log_ni_mg_l_start =ifelse(is.na(log_ni_mg_l_start), log_ni_mg_l_start2, log_ni_mg_l_start),
+         log_no2_no3_n_mg_l_n_start=ifelse(is.na(log_no2_no3_n_mg_l_n_start), log_no2_no3_n_mg_l_n_start2, log_no2_no3_n_mg_l_n_start),
+         log_pb_mg_l_start=ifelse(is.na(log_pb_mg_l_start), log_pb_mg_l_start2, log_pb_mg_l_start),
+         log_po4_p_mg_l_p_start=ifelse(is.na(log_po4_p_mg_l_p_start), log_po4_p_mg_l_p_start2, log_po4_p_mg_l_p_start),
+         log_si_mg_l_start=ifelse(is.na(log_si_mg_l_start), log_si_mg_l_start2, log_si_mg_l_start),
+         log_toc_mg_l_c_start=ifelse(is.na(log_toc_mg_l_c_start), log_toc_mg_l_c_start2, log_toc_mg_l_c_start),
+         log_tot_n_t_nb_mg_l_n_start=ifelse(is.na(log_tot_n_t_nb_mg_l_n_start), log_tot_n_t_nb_mg_l_n_start2, log_tot_n_t_nb_mg_l_n_start),
+         log_tot_p_mg_l_p_start=ifelse(is.na(log_tot_p_mg_l_p_start), log_tot_p_mg_l_p_start2, log_tot_p_mg_l_p_start),
+         log_v_mg_l_start=ifelse(is.na(log_v_mg_l_start), log_v_mg_l_start2, log_v_mg_l_start),
+         log_zn_mg_l_start=ifelse(is.na(log_zn_mg_l_start), log_zn_mg_l_start2, log_zn_mg_l_start),
+         alk_acid_mekv_l_start=ifelse(is.na(alk_acid_mekv_l_start), alk_acid_mekv_l_start2, alk_acid_mekv_l_start),
+         log_absf_start=ifelse(is.na(log_absf_start), log_absf_start2, log_absf_start),
+         p_h_start=ifelse(is.na(p_h_start), p_h_start2, p_h_start),
+         log_so4_start=ifelse(is.na(log_so4_start), log_so4_start2, log_so4_start))%>%
+  select(ID, log_ca_mg_l_start:log_so4_start)->lakes_startvalue
+
+
+```
+
+Create variables describing the change between 2012 and 2023.
+```{r, include=FALSE}
+lakes2 %>%
+  filter(year>2011) %>%
+  group_by(ID) %>%
+  arrange(year)%>%
+  mutate(
+    #Al_change=(last(log_al_mg_l)-first(log_al_mg_l))/(last(year)-first(year)),
+    #     As_change=(last(log_as_mg_l)-first(log_as_mg_l))/(last(year)-first(year)),
+         Ca_change=(last(log_ca_mg_l)-first(log_ca_mg_l))/(last(year)-first(year)),
+         Cd_change=(last(log_cd_mg_l)-first(log_cd_mg_l))/(last(year)-first(year)),
+         Cl_change=(last(log_cl_mg_l)-first(log_cl_mg_l))/(last(year)-first(year)),
+         Co_change=(last(log_co_mg_l)-first(log_co_mg_l))/(last(year)-first(year)),
+         Cr_change=(last(log_cr_mg_l)-first(log_cr_mg_l))/(last(year)-first(year)),
+         Cu_change=(last(log_cu_mg_l)-first(log_cu_mg_l))/(last(year)-first(year)),
+         F_change=(last(log_f_mg_l)-first(log_f_mg_l))/(last(year)-first(year)),
+         Fe_change=(last(log_fe_mg_l)-first(log_fe_mg_l))/(last(year)-first(year)),
+         K_change=(last(log_k_mg_l)-first(log_k_mg_l))/(last(year)-first(year)),
+         Kond_change=(last(log_kond_25_m_s_m)-first(log_kond_25_m_s_m))/(last(year)-first(year)),
+         Mg_change=(last(log_mg_mg_l)-first(log_mg_mg_l))/(last(year)-first(year)),
+         Mn_change=(last(log_mn_mg_l)-first(log_mn_mg_l))/(last(year)-first(year)),
+         Na_change=(last(log_na_mg_l)-first(log_na_mg_l))/(last(year)-first(year)),
+         NH4_change=(last(log_nh4_n_mg_l_n)-first(log_nh4_n_mg_l_n))/(last(year)-first(year)),
+         Ni_change=(last(log_ni_mg_l)-first(log_ni_mg_l))/(last(year)-first(year)),
+         NO2NO3_change=(last(log_no2_no3_n_mg_l_n)-first(log_no2_no3_n_mg_l_n))/(last(year)-first(year)),
+         Pb_change=(last(log_pb_mg_l)-first(log_pb_mg_l))/(last(year)-first(year)),
+         PO4_change=(last(log_po4_p_mg_l_p)-first(log_po4_p_mg_l_p))/(last(year)-first(year)),
+         Si_change=(last(log_si_mg_l)-first(log_si_mg_l))/(last(year)-first(year)),
+         TOC_change=(last(log_toc_mg_l_c)-first(log_toc_mg_l_c))/(last(year)-first(year)),
+         TOTN_change=(last(log_tot_n_t_nb_mg_l_n)-first(log_tot_n_t_nb_mg_l_n))/(last(year)-first(year)),
+         TOTP_change=(last(log_tot_p_mg_l_p)-first(log_tot_p_mg_l_p))/(last(year)-first(year)),
+         V_change=(last(log_v_mg_l)-first(log_v_mg_l))/(last(year)-first(year)),
+         Zn_change=(last(log_zn_mg_l)-first(log_zn_mg_l))/(last(year)-first(year)),
+         Alk_change=(last(alk_acid_mekv_l)-first(alk_acid_mekv_l))/(last(year)-first(year)),
+         Absf_change=(last(log_absf)-first(log_absf))/(last(year)-first(year)),
+         pH_change=(last(p_h)-first(p_h))/(last(year)-first(year)),
+         SO4_change=(last(log_so4)-first(log_so4))/(last(year)-first(year)))%>%
+          group_by(ID) %>%
+  slice_tail(n=1) %>%
+  ungroup %>%
+  select(ID, ends_with("change"))->change_all
+         
+lakes2a<-lakes_startvalue%>%left_join(change_all)
+  
+lakes2b<-lakes2 %>%
+  select(ID,area_aro_km2, blandskog:oppen_vatmark, precip_mean, temp_mean, area_aro_km2, elev_utl, temp_start, temp_change, precip_start, precip_change) %>%
+  group_by(ID) %>%
+  slice(1)
+  
+
+lakes2c<-lakes2 %>%
+  select(ID, stationskoordinat_n_x, stationskoordinat_e_y) %>%
+  unique()
+```
+
+
+
+```{r}
+lakes2a %>%
+  select(ID, ends_with("_start"), ends_with("change")) %>%
+  left_join(lakes2b) %>%
+  left_join(lakes2c) %>%
+  drop_na() %>%
+  rename(
+    #Al_start=log_al_mg_l_start,
+    #     As_start=log_as_mg_l_start,
+         Ca_start=log_ca_mg_l_start,
+         Cd_start=log_cd_mg_l_start,
+         Cl_start=log_cl_mg_l_start,
+         Co_start=log_co_mg_l_start,
+         Cr_start=log_cr_mg_l_start,
+         Cu_start=log_cu_mg_l_start,
+         F_start=log_f_mg_l_start,
+         Fe_start=log_fe_mg_l_start,
+         K_start=log_k_mg_l_start,
+         Kond_start=log_kond_25_m_s_m_start,
+         Mg_start=log_mg_mg_l_start,
+         Mn_start=log_mn_mg_l_start,
+         Na_start=log_na_mg_l_start,
+         NH4_start=log_nh4_n_mg_l_n_start,
+         Ni_start=log_ni_mg_l_start, 
+         NO2NO3_start=log_no2_no3_n_mg_l_n_start,
+         Pb_start=log_pb_mg_l_start,
+         PO4_start=log_po4_p_mg_l_p_start,
+         Si_start=log_si_mg_l_start,
+         TOC_start=log_toc_mg_l_c_start,
+         TOTN_start=log_tot_n_t_nb_mg_l_n_start,
+         TOTP_start=log_tot_p_mg_l_p_start,
+         V_start=log_v_mg_l_start,
+         Zn_start=log_zn_mg_l_start,
+         Alk_start=alk_acid_mekv_l_start,
+         Absf_start=log_absf_start,
+         pH_start=p_h_start,
+         SO4_start=log_so4_start,
+         mixed_forest=blandskog,
+         mixed_coniferous=gran_och_barrblandskog,
+         vegetated_other=hedmark,
+         artificial_sufaces=hardgjorda_ytor,
+         other=ingen_tackning,
+         deciduous_forest=lovskog,
+         semi_urban=semiurbant,
+         outcrop=hallmark,
+         inland_water=sjo_och_vattendrag,
+         forest_wetland=skog_pa_vatmark,
+         pine_forest=tallskog,
+         young_forest=ungskog,
+         arable_land=akermark,
+         open_wetland=oppen_vatmark,
+         catchment_area=area_aro_km2,
+         altitude=elev_utl) ->lakes_numeric
+
+```
+
+Run the PCA
+```{r}
+pH.pca <- prcomp(lakes_numeric[,c("Ca_start", "Cl_start", "Kond_start", "Mg_start", "Na_start",  "Alk_start", "pH_start", "SO4_start", "Ca_change", "Cl_change", "Kond_change", "Mg_change", "Na_change",   "SO4_change", "mixed_forest",
+         "mixed_coniferous", "vegetated_other", "artificial_sufaces", "other", "deciduous_forest",       "semi_urban", "inland_water", "forest_wetland", "pine_forest", "young_forest", "arable_land",
+         "open_wetland", "outcrop","temp_mean", "precip_mean", "temp_start", "precip_start", "temp_change", "precip_change", "catchment_area",  "altitude")], center=TRUE,scale=TRUE)  
+```
+
+Visualize the PCA
+```{r}
+
+fviz_pca_var(pH.pca,
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE ,  # Avoid text overlapping
+             title=""  
+             )
+
+fviz_pca_var(pH.pca,
+             axes=c(3,4),
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+```
+
+
+```{r}
+# # Eigenvalues
+# eig.val <- get_eigenvalue(pH.pca)
+# eig.val
+  
+# # Results for Variables
+# res.var <- get_pca_var(pH.pca)
+# res.var$coord          # Coordinates
+# res.var$contrib        # Contributions to the PCs
+# res.var$cos2           # Quality of representation 
+# 
+# # Results for individuals
+# res.ind <- get_pca_ind(pH.pca)
+# res.ind$coord          # Coordinates
+# res.ind$contrib        # Contributions to the PCs
+# res.ind$cos2           # Quality of representation 
+# 
+# 
+# qqnorm(res.ind$coord)  #check for outliers?
+```
+
+
+The station-wise mean-centered variable is computed for all analysed variables to remove site_specific variation. 
+```{r, include=FALSE}
+
+lakes2 %>%
+  filter(year>2011) %>%
+  group_by(ID, stationskoordinat_e_y, stationskoordinat_n_x) %>%
+  summarize(mean_ph=mean(p_h, na.rm=TRUE))->lakes_mean
+
+lakes2 %>%
+  filter(year>2011) %>%
+  left_join(lakes_mean) %>%
+  mutate(pH_cent=p_h - mean_ph,year)->lakes3
+```
+
+
+Extract the coordinates for individual observations from the PCA abd combine with the original lakes data set.
+```{r}
+res.ind <- get_pca_ind(pH.pca)
+
+
+lakes_numeric %>%
+  select(ID) %>%
+  bind_cols(res.ind$coord) %>%
+  right_join(lakes3) %>%
+  drop_na(Dim.1, pH_cent)->lakes3_pca_res
+```
+
+Thematically weighted regression models on PCA coordinates for years 2008 to 2023
+
+```{r}
+lakes3_pca_res%>%
+  filter(year>2011)->lakes3_pca_res2011
+
+lakes.spdf <- SpatialPointsDataFrame(lakes3_pca_res2011[, c("Dim.1", "Dim.2")], lakes3_pca_res2011)
+
+distances<-gw.dist(coordinates(lakes.spdf))
+
+bw<-bw.gwr(pH_cent ~ year,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+
+model_pH_pca<-gwr.basic(pH_cent ~ year, adaptive=TRUE, bw=bw, kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+
+
+hist(model_pH_pca$SDF$Local_R2)
+summary(model_pH_pca$SDF$Local_R2)
+summary(model_pH_pca$SDF$year)
+```
+
+Figure : Thematically weighted regression coefficients on PCA coordinates
+```{r}
+lakes3_pca_res2011$trend<-model_pH_pca$SDF$year
+
+lakes3_pca_res2011%>%arrange(abs(trend))%>%ggplot( aes(x=Dim.1,y=Dim.2))+
+  geom_point(aes(colour=trend))+
+  scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(colour="Linear trend slope")+
+  theme_classic()+
+  ylab("PCA component 2")+
+  xlab("PCA component 1")+
+ theme(axis.title = element_text(size=16), legend.key.size = unit(1, 'cm'))
+```
+
+Thematically weigthed regression model on the third and fourth PCA componentes for supplementary,
+```{r}
+lakes3_pca_res%>%filter(year>2011)->lakes3_pca_res2011
+
+lakes34.spdf <- SpatialPointsDataFrame(lakes3_pca_res2011[, c("Dim.3", "Dim.4")], lakes3_pca_res2011)
+distances34<-gw.dist(coordinates(lakes34.spdf))
+
+bw34<-bw.gwr(pH_cent ~ year,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes34.spdf)
+
+model_pH_pca34<-gwr.basic(pH_cent ~ year, adaptive=TRUE, bw=bw34, kernel="bisquare", parallel.method="omp",data=lakes34.spdf)
+
+lakes3_pca_res2011$trend<-model_pH_pca34$SDF$year
+lakes3_pca_res2011%>%arrange(abs(trend))%>%ggplot( aes(x=Dim.3,y=Dim.4))+
+geom_point(aes(colour=trend))+
+ 
+scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(colour="Linear trend slope")+
+  theme_classic()+
+  ylab("PCA component 4")+
+  xlab("PCA component 3")+
+     theme(axis.title = element_text(size=16), legend.key.size = unit(1, 'cm'))
+```
+
+Fit PLS 
+```{r}
+pls_pH = plsreg1(lakes_numeric[,c("Ca_start", "Cl_start", "Kond_start", "Mg_start", "Na_start",  "Alk_start", "pH_start", "SO4_start", "Ca_change", "Cl_change", "Kond_change", "Mg_change", "Na_change",  "SO4_change", "mixed_forest",
+         "mixed_coniferous", "vegetated_other", "artificial_sufaces", "other", "deciduous_forest",       "semi_urban", "inland_water", "forest_wetland", "pine_forest", "young_forest", "arable_land",
+         "open_wetland", "outcrop","temp_mean", "precip_mean", "temp_start", "temp_change", "precip_start", "precip_change", "catchment_area", "altitude")], lakes_numeric[, "pH_change", drop = FALSE], comps = 12)
+```
+
+Use updated function for plotting PLS results
+```{r}
+source("plot.plsreg1 with ggplot_changed.R")
+rbPal <- colorRampPalette(c("#00AFBB", "#E7B800", "#FC4E07"))
+
+
+df<-cbind(pls_pH$R2Xy[1:36,1], pls_pH$R2Xy[1:36,2])
+max <- df[,2] #df is cumulative, extract the R2 for both components together
+plot_pls<-plot_plsreg1(pls_pH, comps = c(1, 2), where=c("t","t"), main="", 
+             length=0.1, angle=30, lwd=0.8, col_xarrows = rbPal(50)[as.numeric(cut(max,breaks = 50))] ,
+     col_xlabels = rbPal(50)[as.numeric(cut(max,breaks = 50))], col_yarrows = "black",
+     col_ylabel="black")+
+  theme(axis.title = element_text(size=14), legend.key.size = unit(0.6, 'cm'))
+
+
+
+plot_colors<-ggplot(NULL, aes(x=1, y=seq(0,0.8,length.out=50), col=seq(0,0.8,length.out=50)))+
+         geom_point()+
+        scale_color_gradient2(low="#00AFBB", mid="#E7B800", high="#FC4E07", midpoint = 0.4)+
+        labs(color="contrib")+
+        theme(axis.title = element_text(size=16), legend.key.size = unit(0.8, 'cm'))
+
+library(cowplot)
+library(grid)
+legend<-get_legend(plot_colors)
+
+legend_plot<-as_ggplot(legend)
+
+ggarrange(plot_pls, legend_plot,NULL,  ncol=3, widths = c(4, 0.7, 1))
+
+```
+
+
+Combine PLS coordinates with original lakes data
+```{r}
+lakes_numeric%>%select(ID)%>%bind_cols(pls_pH$x.scores[,1:2])%>%right_join(lakes3)%>%drop_na(t1, pH_cent)->lakes3_pls_res
+
+ lakes3_pls_res%>%filter(year>2011)->lakes3_pls_res2011
+
+lakes.spdf <- SpatialPointsDataFrame(lakes3_pls_res2011[, c("t1", "t2")], lakes3_pls_res2011)
+distances<-gw.dist(coordinates(lakes.spdf))
+
+bw<-bw.gwr(pH_cent ~ year,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+
+model_pH_pls<-gwr.basic(pH_cent ~ year, adaptive=TRUE, bw=bw, kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+
+summary(model_pH_pls$SDF$year)
+pval_pH<-gwr.t.adjust((model_pH_pls))
+
+
+hist(model_pH_pls$SDF$Local_R2)
+```
+
+```{r}
+lakes3_pls_res2011$trend<-model_pH_pls$SDF$year
+
+lakes3_pls_res2011%>%arrange(abs(trend))%>%ggplot(aes(x=t1,y=t2))+
+ geom_point(aes(colour=trend))+
+ scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(colour="Linear trend slope")+
+  theme_classic()+
+  ylab("PLS component 2")+
+  xlab("PLS component 1")+
+   theme(axis.title = element_text(size=16), legend.key.size = unit(1, 'cm'))
+```
+
+
+Read coordinates that define the border of Sweden, including the largest lakes. 
+```{r}
+border <- read_excel("sverige_smooth_coordinates_SWEREF.xlsx")
+border1<-subset(border, namn=="sverige", select=c(East_SWERE, North_SWER))
+border_vänern<-subset(border, namn=="vänern", select=c(East_SWERE, North_SWER))
+border_vättern<-subset(border, namn=="vättern", select=c(East_SWERE, North_SWER))
+border_mälaren<-subset(border, namn=="mälaren", select=c(East_SWERE, North_SWER))
+
+```
+
+Figure 5 (right): TWR-PCA in a geographical perspective
+```{r}
+lakes3_pca_res2011%>%cbind(model_pH_pca$SDF$year)->lakes3_pca_res2011_a
+gwr.point_geographical_pca<-lakes3_pca_res2011_a%>% arrange(abs(`model_pH_pca$SDF$year`))%>%
+  ggplot(aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=`model_pH_pca$SDF$year`), size=1)+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+ scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(color="Linear trend slope")+
+  theme_classic()+
+  theme(legend.position="bottom")+
+  ylab("")+
+  xlab("")
+```
+
+Figure 5 (mid): TWR-PLS in a geographical perspective
+```{r}
+lakes3_pls_res2011%>%cbind(model_pH_pls$SDF$year)->lakes3_pls_res2011_a
+
+gwr.point_geographical<-lakes3_pls_res2011_a%>% arrange(abs(`model_pH_pls$SDF$year`))%>%
+  ggplot(aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=`model_pH_pls$SDF$year`), size=1)+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(color="Linear trend slope")+
+  theme_classic()+
+  theme(legend.position="bottom")+
+  ylab("")+
+  xlab("")
+
+
+```
+
+Figure 5 (left): Geographically weighted regression model
+```{r}
+lakes_after_2011<-lakes3%>%filter(year>2011)%>%drop_na(pH_cent)
+lakes_after.spdf <- SpatialPointsDataFrame(lakes_after_2011[, c(5,4)], lakes_after_2011)
+
+bw_after<-bw.gwr(pH_cent ~ year,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes_after.spdf)
+
+model_pH<-gwr.basic(pH_cent ~ year,bw=bw_after,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes_after.spdf)
+
+lakes_after_2011%>%cbind(model_pH$SDF$year)->lakes_after_2011_a
+
+gwr.point_pH<-lakes_after_2011_a%>%arrange(abs(`model_pH$SDF$year`))%>%
+  ggplot( aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=`model_pH$SDF$year`), size=1)+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(color="Linear trend slope")+
+  theme_classic()+
+  theme(legend.position="bottom")+
+  ylab("")+
+  xlab("")
+
+
+
+```
+
+Combine TWR-PCA, TWR-PLS and GWR into one plot
+```{r}
+library(ggpubr)
+ggarrange(gwr.point_geographical_pca, gwr.point_geographical, gwr.point_pH, ncol=3, common.legend = TRUE, legend="bottom")
+
+```
+
+```{r}
+
+
+plot1<- lakes3_pls_res2011%>%arrange(abs(trend))%>%ggplot(aes(x=t1,y=t2, color=trend, text=ID))+
+ geom_point()+
+ scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(colour="Linear trend slope")+
+  theme_classic()+
+  ylab("PLS component 2")+
+  xlab("PLS component 1")+
+   theme(axis.title = element_text(size=16), legend.key.size = unit(1, 'cm'))
+```
+
+
+
+```{r}
+# lakes_numeric_without_extremes<-lakes_numeric%>%filter(!ID %in% c("00263474",   "00202608", "00202639", "00203743", "00262280", "00263325", "00211399", "00184188", "00184201", "00185193", "00185616", "00202147", "00202288", "00202293", "00202402", "00202411", "00202414", "00202427", "00184186", "00185253", "00185555", "00185559", "00260644", "00260672", "00260843", "00261325", "00206076", "00243359", "00260925", "00256352", "39844" )) 
+
+
+lakes_numeric_without_extremes<-lakes_numeric%>%filter(!ID %in% c("00211399", "00203743", "00256352", "00202608", "00256352", "39844", "00262280", "00202639", "00263325", "00260874", "00261161", "00263474", "00202414", "00263291", "00256501", "00261408", "00263381", "00260874")) 
+
+
+pls_pH_without_extremes = plsreg1(lakes_numeric_without_extremes[,c("Ca_start", "Cl_start", "Kond_start", "Mg_start", "Na_start",  "Alk_start", "pH_start", "SO4_start", "Ca_change", "Cl_change", "Kond_change", "Mg_change", "Na_change",   "SO4_change", "mixed_forest",
+         "mixed_coniferous", "vegetated_other", "artificial_sufaces", "other", "deciduous_forest",       "semi_urban", "inland_water", "forest_wetland", "pine_forest", "young_forest", "arable_land",
+         "open_wetland", "outcrop","temp_mean", "precip_mean", "temp_start", "temp_change", "precip_start", "precip_change", "catchment_area",  "altitude")], lakes_numeric_without_extremes[, "pH_change", drop = FALSE], comps = 3)
+
+rbPal <- colorRampPalette(c("#00AFBB", "#E7B800", "#FC4E07"))
+rbPal(50)[as.numeric(cut(pls_pH$R2Xy[1:36,1],breaks = 50))]
+df<-cbind(pls_pH$R2Xy[1:36,1], pls_pH$R2Xy[1:36,2])
+max <- apply(df, 1, max)
+plot_plsreg1(pls_pH_without_extremes, comps = c(1, 2), where=c("t","t"), main="", 
+             length=0.1, angle=30, lwd=0.8, col_xarrows = rbPal(50)[as.numeric(cut(max,breaks = 50))] ,
+     col_xlabels = rbPal(50)[as.numeric(cut(max,breaks = 50))], col_yarrows = "black",
+     col_ylabel="black")
+```
+
+```{r}
+lakes_numeric_without_extremes%>%select(ID)%>%bind_cols(pls_pH_without_extremes$x.scores[,1:2])%>%right_join(lakes3)%>%drop_na(t1, pH_cent)->lakes3_pls_res_without_extremes
+
+
+lakes3_pls_res_without_extremes%>%filter(year>2011)->lakes3_pls_res2011_without_extremes
+
+lakes.spdf <- SpatialPointsDataFrame(lakes3_pls_res2011_without_extremes[, c("t1", "t2")], lakes3_pls_res2011_without_extremes)
+distances<-gw.dist(coordinates(lakes.spdf))
+
+bw<-bw.gwr(pH_cent ~ year,adaptive=TRUE,kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+
+model_pH_pls_without_extremes<-gwr.basic(pH_cent ~ year, adaptive=TRUE, bw=bw, kernel="bisquare", parallel.method="omp",data=lakes.spdf)
+```
+
+```{r}
+lakes3_pls_res2011_without_extremes$trend<-model_pH_pls_without_extremes$SDF$year
+
+lakes3_pls_res2011_without_extremes%>%arrange(abs(trend))%>%ggplot(aes(x=t1,y=t2))+
+   geom_point(aes(colour=trend))+
+  #coord_fixed()+
+  scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(colour="Linear trend slope")+
+  theme_classic()+
+  ylab("")+
+  xlab("")
+```
+
+```{r}
+lakes3_pls_res2011_without_extremes%>%cbind(model_pH_pls_without_extremes$SDF$year)->lakes3_without_extremes
+gwr.point_pH<-lakes3_without_extremes%>%arrange(abs(`model_pH_pls_without_extremes$SDF$year`))%>%
+  ggplot( aes(x=stationskoordinat_e_y,y=stationskoordinat_n_x))+
+  geom_polygon(data = border1,aes(x = East_SWERE, y = North_SWER),fill = "gray",alpha = 0.25)+
+  geom_polygon(data = border_vänern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_vättern,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_polygon(data = border_mälaren,aes(x = East_SWERE, y = North_SWER),fill = "lightblue",alpha = 0.5)+
+  geom_point(aes(colour=`model_pH_pls$SDF$year`), size=1)+
+  geom_path(data = border1,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vänern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_vättern,aes(x = East_SWERE, y = North_SWER))+
+  geom_path(data = border_mälaren,aes(x = East_SWERE, y = North_SWER))+
+  coord_fixed()+
+  scale_colour_gradientn(colors=c("darkblue", "lightblue3", "darkolivegreen1", "yellow", "orange", "brown2", "darkred"),values=c(0, 40, 45,  50, 55, 60, 100)/100,
+                    na.value = "grey50", guide = "colourbar", limits=c(-0.1, 0.1))+
+  labs(color="Linear trend slope")+
+  theme_classic()+
+  theme(legend.position="bottom")+
+  ylab("")+
+  xlab("")
+```
+
+
+
+
